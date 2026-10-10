@@ -1,0 +1,247 @@
+# Reusable deploy workflow for cell1337.xyz apps.
+# Builds each service image in CI, pushes to GHCR, then SSHes into the droplet
+# and runs `docker compose pull && up -d`. Nothing is built on the droplet.
+#
+# Convention:
+#   <svc>/Dockerfile.prod  ->  ghcr.io/<owner>/<app>-<svc>:<tag>
+#   compose service names are <app>-<svc>
+#   compose image tags use ${IMAGE_TAG:-latest}
+
+name: Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: App prefix, e.g. "scriptorium". Also the compose project name and the folder on the droplet.
+        type: string
+        required: true
+      services:
+        description: JSON array of subfolders to build; each needs <svc>/Dockerfile.prod.
+        type: string
+        default: '["server","client"]'
+      compose-file:
+        description: Path to the production compose file in the repo.
+        type: string
+        default: compose.prod.yml
+      image-tag:
+        description: Deploy an existing tag instead of building (rollback). Empty = build this commit.
+        type: string
+        default: ''
+      health-url:
+        description: Optional URL that must return 2xx/3xx after deploy.
+        type: string
+        default: ''
+      deploy-root:
+        description: Parent directory for app folders on the droplet.
+        type: string
+        default: /opt/apps
+    secrets:
+      DEPLOY_HOST:
+        required: true
+      DEPLOY_USER:
+        required: true
+      DEPLOY_SSH_KEY:
+        required: true
+      DEPLOY_KNOWN_HOSTS:
+        required: true
+      ENV_FILE:
+        description: Full contents of the production .env. If empty, the existing server .env is kept.
+        required: false
+      BUILD_ARGS:
+        description: Newline-separated KEY=VALUE build args (e.g. VITE_API_URL=...). Passed to every service build.
+        required: false
+      DEPLOY_PORT:
+        description: SSH port on the droplet. Defaults to 22.
+        required: false
+      DO_FIREWALL_ID:
+        description: DigitalOcean cloud firewall ID. If set, the runner's IP is allowed on the SSH port for the duration of the deploy.
+        required: false
+      DO_API_TOKEN:
+        description: DigitalOcean API token with firewall read/update scope. Required when DO_FIREWALL_ID is set.
+        required: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.vars.outputs.owner }}
+      tag: ${{ steps.vars.outputs.tag }}
+    steps:
+      - id: vars
+        env:
+          INPUT_TAG: ${{ inputs.image-tag }}
+        run: |
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=${INPUT_TAG:-${GITHUB_SHA::12}}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    if: inputs.image-tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        service: ${{ fromJSON(inputs.services) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./${{ matrix.service }}
+          file: ./${{ matrix.service }}/Dockerfile.prod
+          push: true
+          tags: |
+            ghcr.io/${{ needs.prepare.outputs.owner }}/${{ inputs.app-name }}-${{ matrix.service }}:${{ needs.prepare.outputs.tag }}
+            ghcr.io/${{ needs.prepare.outputs.owner }}/${{ inputs.app-name }}-${{ matrix.service }}:latest
+          # Links the package to this repo so the repo's GITHUB_TOKEN can pull it (needed for private repos).
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: ${{ secrets.BUILD_ARGS }}
+          cache-from: type=gha,scope=${{ inputs.app-name }}-${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.app-name }}-${{ matrix.service }}
+
+  deploy:
+    needs: [prepare, build]
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    concurrency:
+      group: deploy-${{ inputs.app-name }}
+      cancel-in-progress: false
+    env:
+      APP: ${{ inputs.app-name }}
+      APP_DIR: ${{ inputs.deploy-root }}/${{ inputs.app-name }}
+      COMPOSE_SRC: ${{ inputs.compose-file }}
+      IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
+      SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
+      # Secrets can't be read in step `if:` conditions, so the firewall ID goes through env.
+      FIREWALL_ID: ${{ secrets.DO_FIREWALL_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Open firewall for this runner
+        if: env.FIREWALL_ID != ''
+        env:
+          DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          RUNNER_IP=$(curl -fsS4 --max-time 10 https://api.ipify.org)
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+          curl -fsS -X POST "https://api.digitalocean.com/v2/firewalls/$FIREWALL_ID/rules" \
+            -H "Authorization: Bearer $DO_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"inbound_rules\":[{\"protocol\":\"tcp\",\"ports\":\"$SSH_PORT\",\"sources\":{\"addresses\":[\"$RUNNER_IP/32\"]}}]}"
+          echo "Allowed $RUNNER_IP on port $SSH_PORT"
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER_NAME: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host target
+            HostName $HOST
+            Port $SSH_PORT
+            User $DEPLOY_USER_NAME
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 15
+            ConnectTimeout 10
+          EOF
+
+      - name: Wait for SSH
+        run: |
+          # A freshly added firewall rule can take a few seconds to apply.
+          for i in $(seq 1 12); do
+            if ssh target true 2>/dev/null; then echo "SSH reachable"; exit 0; fi
+            echo "Attempt $i: SSH not reachable yet, retrying..."; sleep 5
+          done
+          ssh target true   # last try, with the error shown
+
+      - name: Upload compose file
+        run: |
+          ssh target "mkdir -p '$APP_DIR'"
+          scp -q "$COMPOSE_SRC" "target:$APP_DIR/compose.prod.yml"
+
+      - name: Write .env from secret
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+        run: |
+          if [ -n "$ENV_FILE" ]; then
+            printf '%s\n' "$ENV_FILE" | ssh target "umask 077 && cat > '$APP_DIR/.env.tmp' && mv '$APP_DIR/.env.tmp' '$APP_DIR/.env'"
+            echo "Wrote .env from ENV_FILE secret"
+          else
+            ssh target "touch '$APP_DIR/.env' && chmod 600 '$APP_DIR/.env'"
+            echo "ENV_FILE not set; keeping existing server .env"
+          fi
+
+      - name: Pull and restart stack
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Script goes over stdin, so the token never appears in the remote process list.
+          ssh target bash -s <<EOF
+          set -euo pipefail
+          cd '$APP_DIR'
+          echo '$GHCR_TOKEN' | docker login ghcr.io -u '$GHCR_USER' --password-stdin >/dev/null
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          export IMAGE_TAG='$IMAGE_TAG'
+          docker compose -p '$APP' -f compose.prod.yml pull
+          docker compose -p '$APP' -f compose.prod.yml up -d --remove-orphans --wait --wait-timeout 180
+          echo '$IMAGE_TAG' > .current-tag
+          echo "\$(date -Is) $IMAGE_TAG" >> .deploy-history
+          docker image prune -af --filter "until=72h" >/dev/null || true
+          docker compose -p '$APP' -f compose.prod.yml ps
+          EOF
+
+      - name: Close firewall for this runner
+        if: always() && env.RUNNER_IP != ''
+        env:
+          DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
+        run: |
+          curl -fsS -X DELETE "https://api.digitalocean.com/v2/firewalls/$FIREWALL_ID/rules" \
+            -H "Authorization: Bearer $DO_TOKEN" -H "Content-Type: application/json" \
+            -d "{\"inbound_rules\":[{\"protocol\":\"tcp\",\"ports\":\"$SSH_PORT\",\"sources\":{\"addresses\":[\"$RUNNER_IP/32\"]}}]}"
+          echo "Removed $RUNNER_IP from port $SSH_PORT"
+
+      - name: Health check
+        if: inputs.health-url != ''
+        env:
+          HEALTH_URL: ${{ inputs.health-url }}
+        run: |
+          for i in $(seq 1 24); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$HEALTH_URL" || true)
+            if [[ "$code" =~ ^[23] ]]; then
+              echo "Healthy ($code)"; exit 0
+            fi
+            echo "Attempt $i: got $code, retrying..."; sleep 5
+          done
+          echo "Health check failed for $HEALTH_URL"; exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${APP} deploy"
+            echo "- Tag: \`${IMAGE_TAG}\`"
+            echo "- Rollback: Actions → Deploy → Run workflow, with image-tag = a previous tag"
+          } >> "$GITHUB_STEP_SUMMARY"
