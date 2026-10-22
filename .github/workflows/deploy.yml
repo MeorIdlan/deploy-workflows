@@ -6,6 +6,11 @@
 #   <svc>/Dockerfile.prod  ->  ghcr.io/<owner>/<app>-<svc>:<tag>
 #   compose service names are <app>-<svc>
 #   compose image tags use ${IMAGE_TAG:-latest}
+#
+# Optional build inputs (empty = the convention above):
+#   dockerfile  Dockerfile path for every service, e.g. "Dockerfile" for a single-image app.
+#   context     Build context for every service, e.g. ".".
+#   ref         Commit to check out, build and tag. Empty = the triggering commit (github.sha).
 
 name: Deploy (reusable)
 
@@ -20,6 +25,18 @@ on:
         description: JSON array of subfolders to build; each needs <svc>/Dockerfile.prod.
         type: string
         default: '["server","client"]'
+      dockerfile:
+        description: Dockerfile path used for every service in "services". Empty = <svc>/Dockerfile.prod.
+        type: string
+        default: ''
+      context:
+        description: Build context used for every service in "services". Empty = ./<svc>.
+        type: string
+        default: ''
+      ref:
+        description: Commit to check out, build and tag. Empty = the triggering commit (github.sha). Pass the tested commit when triggered by workflow_run.
+        type: string
+        default: ''
       compose-file:
         description: Path to the production compose file in the repo.
         type: string
@@ -66,14 +83,18 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       owner: ${{ steps.vars.outputs.owner }}
+      ref: ${{ steps.vars.outputs.ref }}
       tag: ${{ steps.vars.outputs.tag }}
     steps:
       - id: vars
         env:
           INPUT_TAG: ${{ inputs.image-tag }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
+          REF=${INPUT_REF:-$GITHUB_SHA}
           echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
-          echo "tag=${INPUT_TAG:-${GITHUB_SHA::12}}" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "tag=${INPUT_TAG:-${REF::12}}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -88,6 +109,8 @@ jobs:
         service: ${{ fromJSON(inputs.services) }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -99,8 +122,8 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: ./${{ matrix.service }}
-          file: ./${{ matrix.service }}/Dockerfile.prod
+          context: ${{ inputs.context != '' && inputs.context || format('./{0}', matrix.service) }}
+          file: ${{ inputs.dockerfile != '' && inputs.dockerfile || format('./{0}/Dockerfile.prod', matrix.service) }}
           push: true
           tags: |
             ghcr.io/${{ needs.prepare.outputs.owner }}/${{ inputs.app-name }}-${{ matrix.service }}:${{ needs.prepare.outputs.tag }}
@@ -131,6 +154,8 @@ jobs:
       FIREWALL_ID: ${{ secrets.DO_FIREWALL_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: Open firewall for this runner
         if: env.FIREWALL_ID != ''
