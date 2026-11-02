@@ -1,6 +1,10 @@
 # Reusable deploy workflow for cell1337.xyz apps.
-# Builds each service image in CI, pushes to GHCR, then SSHes into the droplet
-# and runs `docker compose pull && up -d`. Nothing is built on the droplet.
+# Builds each service image in CI, pushes to GHCR, then SSHes into the server and
+# restarts the stack. Nothing is built on the server.
+#
+# The server type follows the repo's secrets, so callers don't change:
+#   TC_INSTANCE_ID set    Tencent Lighthouse: rootless Podman (scripts/podman-deploy.sh)
+#   otherwise             DigitalOcean droplet: docker compose
 #
 # Convention:
 #   <svc>/Dockerfile.prod  ->  ghcr.io/<owner>/<app>-<svc>:<tag>
@@ -77,6 +81,15 @@ on:
       DO_API_TOKEN:
         description: DigitalOcean API token with firewall read/update scope. Required when DO_FIREWALL_ID is set.
         required: false
+      TC_INSTANCE_ID:
+        description: Tencent Lighthouse instance ID. If set, deploys with Podman and opens the Lighthouse firewall for the runner.
+        required: false
+      TC_SECRET_ID:
+        description: API key ID for a Tencent CAM user limited to the Lighthouse firewall. Required when TC_INSTANCE_ID is set.
+        required: false
+      TC_SECRET_KEY:
+        description: API key secret for that CAM user. Required when TC_INSTANCE_ID is set.
+        required: false
 
 jobs:
   prepare:
@@ -152,13 +165,34 @@ jobs:
       SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
       # Secrets can't be read in step `if:` conditions, so the firewall ID goes through env.
       FIREWALL_ID: ${{ secrets.DO_FIREWALL_ID }}
+      TC_INSTANCE_ID: ${{ secrets.TC_INSTANCE_ID }}
+      TC_REGION: ap-singapore
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.ref }}
 
+      # Callers run this workflow from @main, so their checkout above doesn't hold these scripts.
+      - name: Fetch deploy scripts
+        if: env.TC_INSTANCE_ID != ''
+        uses: actions/checkout@v4
+        with:
+          repository: MeorIdlan/deploy-workflows
+          ref: main
+          path: .deploy-workflows
+
+      - name: Open Lighthouse firewall for this runner
+        if: env.TC_INSTANCE_ID != ''
+        env:
+          TC_SECRET_ID: ${{ secrets.TC_SECRET_ID }}
+          TC_SECRET_KEY: ${{ secrets.TC_SECRET_KEY }}
+        run: |
+          RUNNER_IP=$(curl -fsS4 --max-time 10 https://api.ipify.org)
+          python3 .deploy-workflows/scripts/lighthouse_firewall.py open "$RUNNER_IP" "$SSH_PORT" "gha-$APP-$GITHUB_RUN_ID"
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
       - name: Open firewall for this runner
-        if: env.FIREWALL_ID != ''
+        if: env.FIREWALL_ID != '' && env.TC_INSTANCE_ID == ''
         env:
           DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
@@ -218,7 +252,26 @@ jobs:
             echo "ENV_FILE not set; keeping existing server .env"
           fi
 
+      - name: Pull and restart stack (Podman)
+        if: env.TC_INSTANCE_ID != ''
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Everything goes over stdin, so the token never appears in the remote process list.
+          # The function makes bash read the whole script first, and </dev/null stops any
+          # command inside it from swallowing the rest of the script from stdin.
+          {
+            printf 'APP=%q APP_DIR=%q IMAGE_TAG=%q GHCR_USER=%q GHCR_TOKEN=%q\n' \
+              "$APP" "$APP_DIR" "$IMAGE_TAG" "$GHCR_USER" "$GHCR_TOKEN"
+            echo 'podman_deploy() {'
+            cat .deploy-workflows/scripts/podman-deploy.sh
+            echo '}'
+            echo 'podman_deploy </dev/null'
+          } | ssh target bash -s
+
       - name: Pull and restart stack
+        if: env.TC_INSTANCE_ID == ''
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -238,8 +291,15 @@ jobs:
           docker compose -p '$APP' -f compose.prod.yml ps
           EOF
 
+      - name: Close Lighthouse firewall for this runner
+        if: always() && env.RUNNER_IP != '' && env.TC_INSTANCE_ID != ''
+        env:
+          TC_SECRET_ID: ${{ secrets.TC_SECRET_ID }}
+          TC_SECRET_KEY: ${{ secrets.TC_SECRET_KEY }}
+        run: python3 .deploy-workflows/scripts/lighthouse_firewall.py close "$RUNNER_IP" "$SSH_PORT" "gha-$APP-$GITHUB_RUN_ID"
+
       - name: Close firewall for this runner
-        if: always() && env.RUNNER_IP != ''
+        if: always() && env.RUNNER_IP != '' && env.TC_INSTANCE_ID == ''
         env:
           DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
         run: |
