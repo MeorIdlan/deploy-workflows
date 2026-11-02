@@ -1,10 +1,7 @@
 # Reusable deploy workflow for cell1337.xyz apps.
-# Builds each service image in CI, pushes to GHCR, then SSHes into the server and
-# restarts the stack. Nothing is built on the server.
-#
-# The server type follows the repo's secrets, so callers don't change:
-#   TC_INSTANCE_ID set    Tencent Lighthouse: rootless Podman (scripts/podman-deploy.sh)
-#   otherwise             DigitalOcean droplet: docker compose
+# Builds each service image in CI, pushes to GHCR, opens the Tencent Lighthouse
+# firewall for the runner, SSHes into the server and restarts the stack under
+# rootless Podman (scripts/podman-deploy.sh). Nothing is built on the server.
 #
 # Convention:
 #   <svc>/Dockerfile.prod  ->  ghcr.io/<owner>/<app>-<svc>:<tag>
@@ -22,7 +19,7 @@ on:
   workflow_call:
     inputs:
       app-name:
-        description: App prefix, e.g. "scriptorium". Also the compose project name and the folder on the droplet.
+        description: App prefix, e.g. "scriptorium". Also the compose project name and the folder on the server.
         type: string
         required: true
       services:
@@ -54,7 +51,7 @@ on:
         type: string
         default: ''
       deploy-root:
-        description: Parent directory for app folders on the droplet.
+        description: Parent directory for app folders on the server.
         type: string
         default: /opt/apps
     secrets:
@@ -73,23 +70,17 @@ on:
         description: Newline-separated KEY=VALUE build args (e.g. VITE_API_URL=...). Passed to every service build.
         required: false
       DEPLOY_PORT:
-        description: SSH port on the droplet. Defaults to 22.
-        required: false
-      DO_FIREWALL_ID:
-        description: DigitalOcean cloud firewall ID. If set, the runner's IP is allowed on the SSH port for the duration of the deploy.
-        required: false
-      DO_API_TOKEN:
-        description: DigitalOcean API token with firewall read/update scope. Required when DO_FIREWALL_ID is set.
+        description: SSH port on the server. Defaults to 22.
         required: false
       TC_INSTANCE_ID:
-        description: Tencent Lighthouse instance ID. If set, deploys with Podman and opens the Lighthouse firewall for the runner.
-        required: false
+        description: Tencent Lighthouse instance ID, whose firewall opens for the runner during a deploy.
+        required: true
       TC_SECRET_ID:
-        description: API key ID for a Tencent CAM user limited to the Lighthouse firewall. Required when TC_INSTANCE_ID is set.
-        required: false
+        description: API key ID for a Tencent CAM user limited to the Lighthouse firewall.
+        required: true
       TC_SECRET_KEY:
-        description: API key secret for that CAM user. Required when TC_INSTANCE_ID is set.
-        required: false
+        description: API key secret for that CAM user.
+        required: true
 
 jobs:
   prepare:
@@ -163,8 +154,6 @@ jobs:
       COMPOSE_SRC: ${{ inputs.compose-file }}
       IMAGE_TAG: ${{ needs.prepare.outputs.tag }}
       SSH_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
-      # Secrets can't be read in step `if:` conditions, so the firewall ID goes through env.
-      FIREWALL_ID: ${{ secrets.DO_FIREWALL_ID }}
       TC_INSTANCE_ID: ${{ secrets.TC_INSTANCE_ID }}
       TC_REGION: ap-singapore
     steps:
@@ -174,15 +163,13 @@ jobs:
 
       # Callers run this workflow from @main, so their checkout above doesn't hold these scripts.
       - name: Fetch deploy scripts
-        if: env.TC_INSTANCE_ID != ''
         uses: actions/checkout@v4
         with:
           repository: MeorIdlan/deploy-workflows
           ref: main
           path: .deploy-workflows
 
-      - name: Open Lighthouse firewall for this runner
-        if: env.TC_INSTANCE_ID != ''
+      - name: Open firewall for this runner
         env:
           TC_SECRET_ID: ${{ secrets.TC_SECRET_ID }}
           TC_SECRET_KEY: ${{ secrets.TC_SECRET_KEY }}
@@ -190,18 +177,6 @@ jobs:
           RUNNER_IP=$(curl -fsS4 --max-time 10 https://api.ipify.org)
           python3 .deploy-workflows/scripts/lighthouse_firewall.py open "$RUNNER_IP" "$SSH_PORT" "gha-$APP-$GITHUB_RUN_ID"
           echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-
-      - name: Open firewall for this runner
-        if: env.FIREWALL_ID != '' && env.TC_INSTANCE_ID == ''
-        env:
-          DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
-        run: |
-          RUNNER_IP=$(curl -fsS4 --max-time 10 https://api.ipify.org)
-          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
-          curl -fsS -X POST "https://api.digitalocean.com/v2/firewalls/$FIREWALL_ID/rules" \
-            -H "Authorization: Bearer $DO_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"inbound_rules\":[{\"protocol\":\"tcp\",\"ports\":\"$SSH_PORT\",\"sources\":{\"addresses\":[\"$RUNNER_IP/32\"]}}]}"
-          echo "Allowed $RUNNER_IP on port $SSH_PORT"
 
       - name: Configure SSH
         env:
@@ -252,8 +227,7 @@ jobs:
             echo "ENV_FILE not set; keeping existing server .env"
           fi
 
-      - name: Pull and restart stack (Podman)
-        if: env.TC_INSTANCE_ID != ''
+      - name: Pull and restart stack
         env:
           GHCR_USER: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -270,43 +244,12 @@ jobs:
             echo 'podman_deploy </dev/null'
           } | ssh target bash -s
 
-      - name: Pull and restart stack
-        if: env.TC_INSTANCE_ID == ''
-        env:
-          GHCR_USER: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Script goes over stdin, so the token never appears in the remote process list.
-          ssh target bash -s <<EOF
-          set -euo pipefail
-          cd '$APP_DIR'
-          echo '$GHCR_TOKEN' | docker login ghcr.io -u '$GHCR_USER' --password-stdin >/dev/null
-          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-          export IMAGE_TAG='$IMAGE_TAG'
-          docker compose -p '$APP' -f compose.prod.yml pull
-          docker compose -p '$APP' -f compose.prod.yml up -d --remove-orphans --wait --wait-timeout 180
-          echo '$IMAGE_TAG' > .current-tag
-          echo "\$(date -Is) $IMAGE_TAG" >> .deploy-history
-          docker image prune -af --filter "until=72h" >/dev/null || true
-          docker compose -p '$APP' -f compose.prod.yml ps
-          EOF
-
-      - name: Close Lighthouse firewall for this runner
-        if: always() && env.RUNNER_IP != '' && env.TC_INSTANCE_ID != ''
+      - name: Close firewall for this runner
+        if: always() && env.RUNNER_IP != ''
         env:
           TC_SECRET_ID: ${{ secrets.TC_SECRET_ID }}
           TC_SECRET_KEY: ${{ secrets.TC_SECRET_KEY }}
         run: python3 .deploy-workflows/scripts/lighthouse_firewall.py close "$RUNNER_IP" "$SSH_PORT" "gha-$APP-$GITHUB_RUN_ID"
-
-      - name: Close firewall for this runner
-        if: always() && env.RUNNER_IP != '' && env.TC_INSTANCE_ID == ''
-        env:
-          DO_TOKEN: ${{ secrets.DO_API_TOKEN }}
-        run: |
-          curl -fsS -X DELETE "https://api.digitalocean.com/v2/firewalls/$FIREWALL_ID/rules" \
-            -H "Authorization: Bearer $DO_TOKEN" -H "Content-Type: application/json" \
-            -d "{\"inbound_rules\":[{\"protocol\":\"tcp\",\"ports\":\"$SSH_PORT\",\"sources\":{\"addresses\":[\"$RUNNER_IP/32\"]}}]}"
-          echo "Removed $RUNNER_IP from port $SSH_PORT"
 
       - name: Health check
         if: inputs.health-url != ''
